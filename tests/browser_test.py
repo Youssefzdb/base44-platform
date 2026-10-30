@@ -41,7 +41,7 @@ with sync_playwright() as p:
     # 3 AI create app from prompt → builder
     page.fill(".prompt textarea", "A CRM to track my clients and deals")
     page.click(".prompt button")
-    page.wait_for_url("**/app/**", timeout=30000)
+    page.wait_for_url("**/app/**", timeout=90000)
     page.wait_for_selector(".chat-body", timeout=10000)
     name = page.locator(".work-head b").inner_text().strip()
     check("3. builder loaded (AI spec)", bool(name) and name.lower() != "untitled app", "name=%r" % name)

@@ -119,6 +119,14 @@ DEFAULT_T = APP_TEMPLATES["crm"]
 def slugify(s):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-") or "app"
 
+def unique_subdomain(d, base, excl=None):
+    s = slugify(base or "app") or "app"
+    taken = {a.get("sub_domain") for a in d["apps"] if a["id"] != excl}
+    cand = s
+    while cand in taken:
+        cand = s + "-" + uuid.uuid4().hex[:4]
+    return cand
+
 def mk_field(fname, ftype=None):
     fl = fname.lower()
     t = ftype or ("number" if re.search(r"price|amount|value|count|qty", fl)
@@ -332,6 +340,12 @@ Rules:
 AI_TOOLS = [
     {"type": "function", "function": {"name": "think", "description": "Plan before acting. Call FIRST, optionally again mid-turn.",
         "parameters": {"type": "object", "properties": {"plan": {"type": "string", "description": "1-4 sentences of reasoning"}}, "required": ["plan"]}}},
+    {"type": "function", "function": {"name": "file_write", "description": "Write ONE complete source file of the generated React website (JSX/JS/CSS). Full content every call; overwrite = rewrite whole file.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "e.g. src/App.jsx, src/components/Navbar.jsx, src/styles.css, src/data/menu.js"},
+            "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "finish", "description": "Call LAST when the whole website is written.",
+        "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}},
     {"type": "function", "function": {"name": "upsert_entity", "description": "Create or fully replace an entity (data table) + its list page.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"}, "fields": {"type": "array", "items": {"type": "object", "properties": {
@@ -348,6 +362,30 @@ AI_TOOLS = [
     {"type": "function", "function": {"name": "set_summary", "description": "One-line description shown on the home grid.",
         "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}},
 ]
+
+WEBSITE_RE = re.compile(r"website|web-? ?site|landing( page)?|portfolio|restaurant|cafe|caf[ée]|menu|e-?commerce|onlinestore|store site|shop site|boutique|template site|maw9a[39]|situ we?b", re.I)
+
+WEBSITE_AGENT_PROMPT = """You are Base44's website architect. From the user's request you build a COMPLETE, modern, production-quality React website from scratch — using ONLY tool calls, no other dependencies.
+
+Mandatory flow:
+1. FIRST tool call: think(plan) — the file tree you will write + design direction (palette, typography, layout).
+2. SECOND tool call: rename_app("<Brand Name>") with a short polished brand name taken from the request (e.g. "Dar El Fekhar") + set_summary(...) one line.
+3. Then write EVERY file with file_write() (full content in ONE call each): at minimum
+   - src/App.jsx (entry: imports + renders the full site, default export)
+   - src/components/*.jsx — Navbar (with mobile menu toggle), Hero (headline + CTA + unsplash bg image allowed), and section components matching the business (e.g. Menu/Cards/Features/Testimonials/Gallery/About), Cta, Contact (mailto link form fake submit), Footer (columns: brand + links + hours/social)
+   - src/styles.css — THE whole stylesheet: CSS variables (palette from the brand), system font stack, gradients, hover/focus transitions, box-shadows, border-radius, grid/flex layout, responsive @media breakpoints, .container/.btn/.section/.card utility classes
+   - src/data/*.js when the site needs content (e.g. menu items with prices) — imported by components
+3. LAST tool call: finish(summary) — 1 short sentence for the user.
+
+Hard rules:
+- Imports ONLY from 'react', 'react-dom' or relative paths ('./x' from src/, '../components/x' from pages...jsx). NO other npm packages. No router — sections in single page + smooth anchor scroll.
+- JSX only with className (NOT class). Use only CSS in styles.css (no inline style objects as primary styling).
+- Truly polished: spacing consistent, hover transitions (transition + :hover), focus states, aria-labels on nav toggles/buttons, alt on <img>, semantic <header><main><section><footer>.
+- Cohesive brand: derive 2 accent colors + 1 neutral from the business theme; big display hero with letter-spacing.
+- Copy in the user's language, realistic and business-specific (no lorem ipsum, no TODO, nothing left blank).
+- Keep every file complete and self-contained; never reference files you never wrote.
+- At most 3 file_write calls per assistant round; if more files remain, continue in the next round.
+- Also update rename_app/summary etc. when the change affects them."""
 
 def _norm_fields(fields):
     out = []
@@ -371,6 +409,38 @@ def ai_execute_tool(app, name, args, emit):
     if name == "think":
         emit({"type": "thinking", "text": str(args.get("plan", ""))[:600]})
         return "plan noted — proceed with tools"
+    if name == "file_write":
+        rel = re.sub(r"^\./", "", str(args.get("path") or "").strip().lstrip("/"))
+        if ".." in rel or not re.search(r"\.(jsx|js|css|json)$", rel):
+            return {"error": "path must be relative and end in .jsx/.js/.css/.json"}
+        content = str(args.get("content") or "")
+        # sloppy JSON escaping from the model: backslash(s) glued to a real newline → invalid
+        #   in JSX/JS/JSON/CSS files (no line-continuation in these languages) → normalize
+        content = re.sub(r"\\+\r?\n", "\n", content)
+        if "\n" not in content and "\\n" in content:   # fully double-escaped payload
+            content = content.replace("\\r\\n", "\n").replace("\\n", "\n").replace('\\"', '"').replace("\\t", "\t")
+        if len(content) > 24000:
+            content = content[:24000]
+        gf = app.setdefault("gen_files", {})
+        gf[rel] = content
+        app["mode"] = "website"
+        emit({"type": "file", "path": rel, "bytes": len(content), "total": len(gf)})
+        emit({"type": "preview", "changed": "file_write", "file_count": len(gf)})
+        res = {"written": rel, "bytes": len(content), "site_files": len(gf)}
+        tail = content.rstrip()
+        if rel.endswith(".jsx") and tail and tail[-1] not in '>)}`"-\'':
+            res["warning"] = "file may be truncated (rewrite it fully with file_write)"
+        return res
+    if name == "finish":
+        gf = app.get("gen_files") or {}
+        missing = []
+        if app.get("mode") == "website":
+            if not any(p.endswith(".css") for p in gf):
+                missing.append("src/styles.css")
+            if not any("App.jsx" in p for p in gf):
+                missing.append("src/App.jsx")
+        emit({"type": "tool", "name": "finish", "args": {}, "result": "missing: " + ",".join(missing) if missing else "site complete"})
+        return {"ok": "noted", "missing_files": missing} if missing else {"ok": "assembly finished"}
     if name == "upsert_entity":
         ename = (args.get("name") or "Item").strip().title()[:24]
         slug = slugify(ename)
@@ -438,23 +508,41 @@ def ai_spec_context(app):
         "pages": [p["name"] + "(" + p.get("type", "list") + ")" for p in spec.get("pages", [])],
     }, ensure_ascii=False)
 
-def ai_agent_conversation(app, instruction, is_new, emit, rounds=4):
-    """Multi-round tool-calling loop. Returns final assistant text (or raises)."""
-    msgs = [{"role": "system", "content": BASE44_AGENT_PROMPT + "\n\nCURRENT APP STATE: " + ai_spec_context(app)}]
+def ai_agent_conversation(app, instruction, is_new, emit, rounds=0, website=None):
+    """Multi-round tool-calling loop. Returns (final_text, touched)."""
+    if website is None:
+        website = bool(app.get("mode") == "website" or WEBSITE_RE.search(instruction))
+    if website:
+        gf = app.setdefault("gen_files", {})
+        tree = ", ".join(f"{p}({len(c)}b)" for p, c in sorted(gf.items())) or "(empty — fresh build)"
+        state = "CURRENT SITE FILES: " + tree
+        state += ("\nThis app ALSO has an internal-tool spec: " + ai_spec_context(app)) if app.get("spec", {}).get("entities") else ""
+    else:
+        state = "CURRENT APP STATE: " + ai_spec_context(app)
+    sysmsg = (WEBSITE_AGENT_PROMPT if website else BASE44_AGENT_PROMPT) + "\n\n" + state
+    msgs = [{"role": "system", "content": sysmsg}]
     if is_new:
-        msgs.append({"role": "user", "content": "Baseline build — user request: " + instruction})
+        msgs.append({"role": "user", "content": ("Build this website — user request: " if website else "Baseline build — user request: ") + instruction})
     else:
         msgs += (app.get("ai_history") or [])[-8:]
-        msgs.append({"role": "user", "content": "User change request: " + instruction})
+        msgs.append({"role": "user", "content": ("User website change request: " if website else "User change request: ") + instruction})
     final_text, touched = "", False
+    empty_rounds = 0
+    if rounds <= 0:
+        rounds = 6 if website else 4
     for _ in range(rounds):
-        m = oai_chat(msgs, tools=AI_TOOLS)
+        m = oai_chat(msgs, tools=AI_TOOLS, max_tokens=4500 if website else 1300)
         msgs.append({"role": "assistant", "content": m.get("content"),
                      **({"tool_calls": m["tool_calls"]} if m.get("tool_calls") else {})})
         tcs = m.get("tool_calls") or []
         if not tcs:
-            final_text = (m.get("content") or "").strip()
-            break
+            empty_rounds += 1
+            if not is_new or empty_rounds >= 2:
+                final_text = (m.get("content") or "").strip()
+                break
+            msgs.append({"role": "user", "content": "IMPORTANT: work ONLY through tool calls (think / " +
+                         ("file_write / finish" if website else "upsert_entity / add_page / set_theme") + "). Start now — no plain text."})
+            continue
         for tc in tcs:
             fn = tc["function"]["name"]
             try:
@@ -465,6 +553,10 @@ def ai_agent_conversation(app, instruction, is_new, emit, rounds=4):
             res = ai_execute_tool(app, fn, args, emit)
             if fn == "think":
                 msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(res)})
+                continue
+            if fn in ("file_write", "finish"):
+                msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(res)})
+                touched = True
                 continue
             touched = True
             after = json.dumps(app["spec"], default=str)
@@ -477,20 +569,52 @@ def ai_agent_conversation(app, instruction, is_new, emit, rounds=4):
     return final_text, touched
 
 def ai_agent_create(prompt):
-    """AI-first app creation. Returns (spec_dict, name, theme, summary, ai_history) or None on failure."""
+    """AI-first app creation. Returns dict (spec/name/theme/summary/ai_history[/mode/gen_files]) or None."""
     if not AI_KEYS or AI_DISABLED:
         return None
-    appshell = {"name": "", "theme": {}, "summary": "", "spec": {"entities": [], "pages": []}, "messages": []}
-    emit = Emitter(lambda ev: None)   # sync create — no live stream needed
-    try:
-        ai_agent_conversation(appshell, prompt, is_new=True, emit=emit, rounds=5)
-    except Exception:
+    website = bool(WEBSITE_RE.search(prompt))
+    result = None
+    for attempt in range(3):                                     # models sometimes reply without tools → retry
+        appshell = {"name": "", "theme": {}, "summary": "", "spec": {"entities": [], "pages": []}, "gen_files": {}}
+        if website:
+            appshell["mode"] = "website"
+        emit = Emitter(lambda ev: None)   # sync create — no live stream needed
+        try:
+            ai_agent_conversation(appshell, prompt, is_new=True, emit=emit, rounds=7 if website else 5)
+        except Exception:
+            continue
+        spec = appshell["spec"]
+        if website and appshell.get("gen_files") and any("App.jsx" in k for k in appshell["gen_files"]):
+            result = appshell; break
+        if not website and spec.get("entities"):
+            result = appshell; break
+    if not result:
         return None
-    spec = appshell["spec"]
-    if not spec.get("entities"):
-        return None
-    return {"spec": spec, "name": appshell["name"], "theme": appshell.get("theme"),
-            "summary": appshell["summary"], "ai_history": appshell.get("ai_history", [])}
+    if result.get("mode") == "website":
+        gf = result["gen_files"]
+        if not any(p.endswith(".css") for p in gf):                     # guarantee a stylesheet exists
+            gf = dict(gf); gf["src/styles.css"] = DEFAULT_SITE_CSS
+        if not result["name"] or len(result["name"]) > 40:   # ugly/missing name → derive brand from prompt
+            m = re.search(r"(?:called|named|bism|smiya)\s+[\"']?([A-Za-z][\w'&\- ]{2,40})", prompt, re.I)
+            nm = (m.group(1).strip().strip(",.;:'\"") if m else (prompt.lower().split("called")[-1].split(",")[0].strip().title()[:32] if "called" in prompt.lower() else prompt.split()[0].title()[:32]))
+            result["name"] = nm.title()[:40]
+        return {"spec": result["spec"], "name": result["name"], "theme": result.get("theme"),
+                "summary": result["summary"], "ai_history": result.get("ai_history", []),
+                "mode": "website", "gen_files": gf}
+    return {"spec": result["spec"], "name": result["name"], "theme": result.get("theme"),
+            "summary": result["summary"], "ai_history": result.get("ai_history", [])}
+
+DEFAULT_SITE_CSS = """/* src/styles.css — Base44 auto-generated baseline (brand vars + utilities) */
+:root{--brand:#c1442e;--brand-2:#221f1c;--neutral:#faf7f2;--cta:#c1442e}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Avenir Next","Segoe UI",system-ui,-apple-system,sans-serif;color:#221f1c;background:var(--neutral);line-height:1.6}
+.container{max-width:1100px;margin:0 auto;padding:0 24px}
+.btn{display:inline-block;padding:12px 24px;border-radius:999px;background:var(--cta);color:#fff;text-decoration:none;font-weight:600;transition:transform .2s,box-shadow .2s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 12px 26px rgba(0,0,0,.18)}
+section{padding:64px 0}
+img{max-width:100%;border-radius:14px}
+@media(max-width:760px){h1{font-size:34px}section{padding:44px 0}}
+"""
 
 def run_agent_stream(app, instruction, d, u, emit):
     """Full agent turn: AI (tool calls + think) → fallback deterministic. Owns finalize + done event."""
@@ -679,7 +803,8 @@ class Handler(SimpleHTTPRequestHandler):
             app = next((a for a in d["apps"] if a.get("sub_domain") == m.group(1) and a["state"] == "published"), None)
             if not app:
                 return self.js({"error": "not_found"}, 404)
-            return self.js({"name": app["name"], "theme": app.get("theme"), "spec": app["spec"]})
+            return self.js({"name": app["name"], "theme": app.get("theme"), "spec": app["spec"],
+                            "mode": app.get("mode", "tool"), "gen_files": app.get("gen_files") or {}})
         d, u = approve_auth(self)
         if not u:
             return self.js({"error": "unauthorized"}, 401)
@@ -762,28 +887,33 @@ class Handler(SimpleHTTPRequestHandler):
                 name=body.get("name") or "Untitled App", icon=(body.get("name") or "A")[0].upper(),
                 color="#4d33de", summary=body.get("summary") or "Empty app — describe a change to build it.",
                 entities=[], pages=[])
-            ai_hist = []
+            ai_hist, ai_mode, ai_gen = [], None, None
             if "prompt" in body and usage_total(u) < CREDIT_LIMIT:
                 made = ai_agent_create(prompt)
                 if made:
                     spec = made["spec"]
-                    spec["keywords"] = spec.get("keywords") or "ai"
+                    spec["keywords"] = spec.get("keywords") or ("ai-site" if made.get("mode") == "website" else "ai")
                     spec["icon"] = (made["name"] or spec.get("icon") or "A")[0].upper()
                     app_name = made["name"] or spec.get("name") or prompt[:30].title()
                     spec["name"] = app_name
                     spec["summary"] = made["summary"] or spec.get("summary") or "Built by AI from your prompt."
                     ai_hist = made["ai_history"]
+                    if made.get("mode") == "website":
+                        ai_mode, ai_gen = "website", made.get("gen_files") or {}
+
             app = {"id": "a_" + uuid.uuid4().hex[:10], "name": spec.get("name") or "Untitled App",
                    "user_id": u["id"], "created": time.time(), "updated": time.time(),
                    "state": "draft", "visibility": "private", "live_version": "", "bundle_version": "1",
-                   "sub_domain": slugify(spec.get("name") or "app"), "spec": spec,
+                   "sub_domain": unique_subdomain(d, spec.get("name") or "app"), "spec": spec,     # noqa
                    "files": code_files(spec, {}), "logs": [["t0", "Agent seeding app…"], ["t1", "App shell ready"]],
-                   "credits_used": 1.5, "theme": spec.get("theme", {"accent": "#ff773c"})}
+                   "credits_used": 1.5, "theme": spec.get("theme", {"accent": "#ff773c"}),
+                   "mode": ai_mode or "tool", "gen_files": ai_gen or {}}
+            app["sub_domain"] = unique_subdomain(d, app["name"])
             if "prompt" in body:
                 app["theme"] = (spec.get("theme") if isinstance(spec.get("theme"), dict) and spec.get("theme") else app["theme"])
                 if ai_hist:
                     app["ai_history"] = ai_hist
-                    app["logs"].append([str(time.time()), "AI spec built via tool calls"])
+                    app["logs"].append([str(time.time()), ("AI website built — %d files (tool calls)" if app["mode"] == "website" else "AI spec built via tool calls")])
             d["apps"].append(app); save(d)
             return self.js(pub(app))
         m = re.match(r"^/api/apps/([\w-]+)$", path)
@@ -868,7 +998,8 @@ class Handler(SimpleHTTPRequestHandler):
             app = next((a for a in d["apps"] if a["sub_domain"] == m.group(1) and a["state"] == "published"), None)
             if not app:
                 return self.js({"error": "not_found"}, 404)
-            return self.js({"name": app["name"], "theme": app.get("theme"), "spec": app["spec"]})
+            return self.js({"name": app["name"], "theme": app.get("theme"), "spec": app["spec"],
+                            "mode": app.get("mode", "tool"), "gen_files": app.get("gen_files") or {}})
         return self.js({"error": "unknown_endpoint", "path": path}, 404)
 
     def do_GET(self):
@@ -879,6 +1010,7 @@ class Handler(SimpleHTTPRequestHandler):
         if m:
             with open(os.path.join(WWW, "runtime.html"), "rb") as f:
                 data = f.read()
+            data = data.replace(b"</body>", b"<script>location.hash='#pub=" + m.group(1).encode() + b"'</script></body>")
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(data)))
