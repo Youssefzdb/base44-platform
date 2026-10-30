@@ -31,11 +31,6 @@ for _c in _CANDIDATES:
     if os.path.isfile(os.path.join(_c, "index.html")):
         WWW = _c
         break
-import json as _json
-with open("/tmp/www_chosen", "w") as _dbg:
-    _dbg.write(_json.dumps({"chosen": WWW, "cands": _CANDIDATES,
-                            "flags": [os.path.isfile(os.path.join(_c, "index.html")) for _c in _CANDIDATES],
-                            "here": HERE}, indent=1) + "\n")
 print("serving UI from:", WWW)
 DBP = os.path.join(HERE, "data", "db.json")
 os.makedirs(os.path.join(HERE, "data"), exist_ok=True)
