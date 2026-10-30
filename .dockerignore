@@ -1,0 +1,11 @@
+.git
+www
+data
+__pycache__
+tests
+*.log
+nohup.out
+README.md
+Dockerfile
+docker-compose.yml
+.release-tmp

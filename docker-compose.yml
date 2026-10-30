@@ -1,0 +1,13 @@
+services:
+  base44:
+    build:
+      context: .
+      additional_contexts:
+        react: ../base44-react      # frontend repo (source for the build)
+    image: base44-platform:latest
+    ports:
+      - "8510:8510"
+    restart: unless-stopped
+    # Optionnel — persist mock DB across container rebuilds:
+    # volumes:
+    #   - ./data:/srv/data

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>App</title>
+    <link rel="stylesheet" href="assets/fonts.css" /><link rel="stylesheet" href="assets/tokens.css" />
+    <style>
+      body{font-family:var(--font-body);background:var(--stone-50);color:var(--neutral-950)}
+      header{background:linear-gradient(135deg,var(--accent,#ff773c),var(--stone-900));color:#fff;padding:18px 20px;font-family:var(--font-titles);display:flex;gap:10px;align-items:center;box-shadow:var(--shadow-sm)}
+      header b{font-size:17px}
+      .tabs{display:flex;gap:4px;margin:14px 20px}
+      .rtab{padding:7px 14px;border-radius:var(--radius-lg);border:var(--bw-regular) solid var(--stone-200);background:var(--surface-elevated);font-size:13px;font-weight:600;cursor:pointer}
+      .rtab.active{background:var(--neutral-950);color:#fff}
+      main{margin:0 20px 60px}
+      table{width:100%;border-collapse:collapse;background:var(--surface-elevated);border-radius:var(--radius-card);overflow:hidden;box-shadow:var(--shadow-xs)}
+      th{font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--stone-500);text-align:left;padding:10px 12px;background:var(--stone-100)}
+      td{padding:10px 12px;border-top:var(--bw-thin) solid var(--stone-200);font-size:13px}
+      .add{margin-top:14px;background:var(--surface-elevated);border:var(--bw-thin) solid var(--t-black-5);border-radius:var(--radius-lg);padding:14px;box-shadow:var(--shadow-xs)}
+      .add label{display:block;font-size:11.5px;font-weight:600;color:var(--stone-600);margin:8px 0 3px}
+      .add input.frmin{width:100%;padding:7px 9px;border-radius:var(--radius-md);border:var(--bw-regular) solid var(--stone-300);font-size:13px}
+      .empty{color:var(--stone-500);padding:30px;text-align:center}
+    </style>
+  </head>
+  <body>
+    <header><b id="app-name">App</b></header>
+    <div class="tabs" id="tabs"></div><main id="main"></main>
+    <script>
+      (() => {
+        const page = parseInt((location.hash.match(/#p=(\d)/) || [0, 1])[1] || 1);
+        const m = location.hash.match(/#app=([\w-]+)/);
+        if (!m) { document.body.innerHTML = '<div class="empty">published app only</div>'; return; }
+        fetch(`/api/apps/${m[1]}`, { headers: { Authorization: 'Bearer ' + localStorage.getItem('b44_token') } })
+          .then(r => r.json())
+          .then(app => {
+            document.getElementById('app-name').textContent = app.name;
+            document.documentElement.style.setProperty('--accent', (app.theme && app.theme.accent) || '#ff773c');
+            const pages = (app.spec && app.spec.pages || []);
+            document.getElementById('tabs').innerHTML = pages.map((p, i) =>
+              `<button class="rtab ${i + 1 === page ? 'active' : ''}" data-p="${i + 1}">${p.name}</button>`).join('');
+            const ents = (app.spec && app.spec.entities || []);
+            const p0 = pages[Math.min(page, pages.length) - 1] || pages[0] || {};
+            const ent = ents.find(e => e.slug === p0.entity) || ents[0];
+            const main = document.getElementById('main');
+            if (!ent) { main.innerHTML = '<div class="empty">No entities yet — ask the agent to build something.</div>'; return; }
+            const lsKey = 'b44r_' + app.id + '_' + ent.slug;
+            let rows;
+            try { rows = JSON.parse(localStorage.getItem(lsKey) || 'null') || ent.seed.map(r => Object.fromEntries(ent.fields.map((f, i) => [f.slug, r[i]]))); } catch { rows = []; }
+            const render = () => {
+              main.innerHTML = `<table><tr>${ent.fields.map(f => `<th>${f.name}</th>`).join('')}</tr>` +
+                rows.map(r => `<tr>${ent.fields.map(f => {
+                  const v = r[f.slug]; const s = f.type === 'checkbox' ? (v ? '✓' : '') : (v == null ? '' : String(v));
+                  return `<td>${s}</td>`; }).join('')}</tr>`).join('') + '</table>' +
+                `<div class="add"><b style="font-size:13px">Add ${ent.name}</b>${ent.fields.map(f => `<label>${f.name}</label>` +
+                  (f.type === 'checkbox' ? `<input type="checkbox" name="${f.slug}">` :
+                  `<input class="frmin" name="${f.slug}" placeholder="${f.type}">`)).join('')}
+                <button class="rtab" style="margin-top:10px;background:var(--accent);color:#fff;border-color:transparent">Add record</button></div>`;
+              main.querySelector('button.rtab').addEventListener('click', e => {
+                const rec = {};
+                ent.fields.forEach(f => {
+                  const el = main.querySelector(`[name="${f.slug}"]`);
+                  rec[f.slug] = f.type === 'checkbox' ? el.checked : el.value;
+                });
+                rows.push(rec); localStorage.setItem(lsKey, JSON.stringify(rows)); render(); toast();
+              });
+            };
+            const toast = () => {};
+            render();
+            document.getElementById('tabs').querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+              location.hash = `#app=${m[1]}&p=${b.dataset.p}`;
+            }));
+          })
+          .catch(() => document.getElementById('main').innerHTML = '<div class="empty">Could not load app preview.</div>');
+      })();
+    </script>
+  </body>
+</html>

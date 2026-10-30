@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <script>
+      try {
+        if (localStorage.getItem('appearance-theme') === 'dark') {
+          var r = document.documentElement;
+          r.setAttribute('data-ds', 'base44'); r.setAttribute('data-theme', 'dark');
+          r.classList.add('dark'); r.style.backgroundColor = '#09090b';
+        }
+      } catch (e) {}
+    </script>
+    <meta charset="utf-8" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#ff773c" />
+    <meta name="description" content="Build useful apps, fast with Base44." />
+    <title>Base44</title>
+    <link rel="stylesheet" href="/fonts.css" />
+    <link rel="stylesheet" href="/tokens.css" />
+    <link rel="stylesheet" href="/platform.css" />
+    <script type="module" crossorigin src="/assets/index-f3FVY0gx.js"></script>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+  </body>
+</html>

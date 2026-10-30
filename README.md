@@ -47,6 +47,58 @@ cd base44-platform && python3 server.py   # → http://localhost:8510
 
 Open `http://localhost:8510` → login screen → demo button → home → build.
 
+### UI root selection (server.py)
+
+`server.py` serves the first existing root, in order:
+`./dist` (built React) → `../base44-react/dist` → `./www` (vanilla fallback).
+Build `base44-react` once (`pnpm build`) and the React app is served automatically.
+
+## Docker
+
+No daemon here — the repo ships the compose recipe; run it on any docker host:
+
+```sh
+git clone https://github.com/Youssefzdb/base44-platform   # this repo
+git clone https://github.com/Youssefzdb/base44-react      # sibling dir
+cd base44-platform
+docker compose up --build      # → http://localhost:8510
+```
+
+Multi-stage: `node:24-alpine` (pnpm → vite build of the React app via the
+`react` named build-context) → `python:3.14-slim` runtime (stdlib-only server),
+non-root user, healthcheck on `/index.html`.
+
+## Release
+
+```sh
+GITHUB_TOKEN=ghp_xxx ./release.sh [version]   # default: date-based
+```
+
+Rebuilds the frontend, packages `server.py + www + dist + tests` into
+`base44-platform-<ver>.tar.gz`, creates the GitHub Release and uploads the asset.
+
+**v1.0.0 shipped:**
+https://github.com/Youssefzdb/base44-platform/releases/download/v1.0.0/base44-platform-1.0.0.tar.gz
+(695 KB — unpacked & smoke-tested: index 200, chunk 243 KB, API auth guard live)
+
+## Browser e2e (Playwright)
+
+```sh
+python3 -m pip install playwright && python3 -m playwright install chromium
+python3 server.py &                       # :8510
+python3 tests/browser_test.py             # exit 0 = pass
+```
+
+Real chromium drives the REAL react build — 8 checks:
+
+```
+✓ 1. login card              ✓ 5. code viewer has entity
+✓ 2. hero after demo login   ✓ 6. dark class applied (pre-paint)
+✓ 3. builder loaded          ✓ 7. runtime entity table (iframe)
+✓ 4. agent steps rendered    ✓ 8. publish + custom domain input
+{"pass": 8, "fail": 0}
+```
+
 ## Verification (e2e done)
 
 - [x] auth flow (login/signup/demo) + 401 guard
