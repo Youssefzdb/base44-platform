@@ -604,6 +604,21 @@ class Handler(SimpleHTTPRequestHandler):
         return self.do_POST()
 
 if __name__ == "__main__":
-    print(f"Base44 platform clone → http://localhost:{PORT}")
-    Quieted = QuietServer(("0.0.0.0", PORT), Handler)
-    Quieted.serve_forever()
+    import errno
+    httpd = None
+    port = PORT
+    for _ in range(30):
+        try:
+            httpd = QuietServer(("0.0.0.0", port), Handler)
+            break
+        except OSError as e:
+            if e.errno in (errno.EADDRINUSE, errno.EACCES):
+                print(f"port {port} busy — trying {port + 1}")
+                port += 1
+                continue
+            raise
+    if httpd is None:
+        sys.exit("no free port found")
+    print(f"Base44 platform clone → http://localhost:{port}")
+    print("Ctrl+C to stop")
+    httpd.serve_forever()
