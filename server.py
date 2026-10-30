@@ -17,6 +17,7 @@ Storage: data/db.json
 Run: python3 server.py → http://localhost:8510
 """
 import hashlib, json, os, re, secrets, threading, time, uuid, random, base64, struct, sys
+import urllib.request, urllib.error
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", "8510"))
@@ -248,6 +249,279 @@ def code_files(app_spec, app):
         f"\nexport default [ {', '.join(f'P{i}' for i in range(1, len(pages) + 1))} ]\n" if pages else
         "// No pages yet — describe a change in the agent chat\n")
     return files
+
+# ══════════════════════════════ AI AGENT (OpenAI tool-calling) ══════════════════════════════
+# keys: /gpt.txt (7 project keys, comma-separated). NEVER stored in repo/env dumps.
+KEYS_FILE = os.environ.get("B44_KEYS_FILE", "/gpt.txt")
+
+def load_keys(path):
+    try:
+        raw = open(path, encoding="utf-8", errors="ignore").read()
+        return [k.strip() for k in re.split(r"[,\s]+", raw) if k.strip().startswith("sk-")]
+    except OSError:
+        return []
+
+AI_KEYS = load_keys(KEYS_FILE)
+AI_BASE = os.environ.get("B44_OAI_BASE", "https://api.openai.com/v1")
+AI_MODELS = os.environ.get("B44_MODELS", "gpt-4.1-mini,gpt-4o-mini,gpt-4o").split(",")
+AI_MODEL = AI_MODELS[0]
+AI_DISABLED = os.environ.get("B44_DISABLE_AI") == "1"
+
+OAI_STATE = {"k": 0}          # rotating key index
+OAI_STATE["model_i"] = 0      # current model candidate
+
+def oai_chat(messages, tools=None, max_tokens=900, temperature=0.4):
+    """chat.completions with key+model rotation. Returns the assistant message dict."""
+    if not AI_KEYS:
+        raise RuntimeError("no_keys")
+    tried_models = set()
+    last_err = "openai_failed"
+    for attempt in range(3 * len(AI_KEYS)):
+        key = AI_KEYS[OAI_STATE["k"] % len(AI_KEYS)]
+        model = AI_MODELS[OAI_STATE["model_i"] % len(AI_MODELS)]
+        tried_models.add(model)
+        payload = {"model": model, "messages": messages, "max_tokens": max_tokens}
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        req = urllib.request.Request(
+            AI_BASE + "/chat/completions", data=json.dumps(payload).encode(),
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                out = json.loads(r.read())
+            OAI_STATE["k"] += 1                      # healthy call → rotate for next turn
+            return out["choices"][0]["message"]
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode()[:300]
+            except Exception:
+                pass
+            last_err = f"{e.code}:{body or e.reason}"
+            if e.code in (401, 403):                 # dead key
+                OAI_STATE["k"] += 1
+            elif e.code == 429:                      # rate/budget limited
+                OAI_STATE["k"] += 1
+            elif e.code in (400, 404) and ("model" in body.lower() or e.code == 404):
+                OAI_STATE["model_i"] += 1            # model not allowed → next candidate
+            else:
+                OAI_STATE["k"] += 1
+        except Exception as e:
+            last_err = str(e)[:150]
+            OAI_STATE["k"] += 1
+        except BaseException:                         # noqa: safety net
+            raise
+    raise RuntimeError(last_err)
+
+BASE44_AGENT_PROMPT = """You are the Base44 agent — you turn natural language into working internal tools.
+You act ONLY through tool calls; the platform renders data + pages from your tool calls (you never write code).
+Rules:
+- FIRST tool call of EVERY turn MUST be think(): a short concrete plan (what the user wants; entities, fields, pages you'll touch). Never skip it.
+- Model the data with upsert_entity(): full field list each call, types from
+  text|textarea|number|email|date|checkbox|select and required flags. ALWAYS pass 2-5 realistic seed_rows.
+  One call per entity/table. Prefer re-calling with the full schema when mutating.
+- Use add_page() only for screens beyond the automatic list page of each entity.
+- set_theme() takes a 6-digit hex accent color (e.g. #ff773c).
+- rename_app() and set_summary() (one-line user-facing description) when naming/description should change.
+- Keep apps small, realistic and useful.
+- FINAL reply (no tool call): one short sentence telling the user what they can now do in the app."""
+
+AI_TOOLS = [
+    {"type": "function", "function": {"name": "think", "description": "Plan before acting. Call FIRST, optionally again mid-turn.",
+        "parameters": {"type": "object", "properties": {"plan": {"type": "string", "description": "1-4 sentences of reasoning"}}, "required": ["plan"]}}},
+    {"type": "function", "function": {"name": "upsert_entity", "description": "Create or fully replace an entity (data table) + its list page.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}, "fields": {"type": "array", "items": {"type": "object", "properties": {
+                "name": {"type": "string"}, "type": {"type": "string"}, "required": {"type": "boolean"},
+                "options": {"type": "array", "items": {"type": "string"}}}, "required": ["name"]}},
+            "seed_rows": {"type": "array", "items": {"type": "array", "items": {}}}},
+            "required": ["name", "fields"]}}},
+    {"type": "function", "function": {"name": "add_page", "description": "Add an extra screen (list or form).",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "type": {"type": "string", "enum": ["list", "form"]}, "entity": {"type": "string", "description": "entity slug to bind"}}, "required": ["name"]}}},
+    {"type": "function", "function": {"name": "set_theme", "description": "Set the app accent color.",
+        "parameters": {"type": "object", "properties": {"accent": {"type": "string"}}, "required": ["accent"]}}},
+    {"type": "function", "function": {"name": "rename_app", "description": "Rename the app.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {"name": "set_summary", "description": "One-line description shown on the home grid.",
+        "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}},
+]
+
+def _norm_fields(fields):
+    out = []
+    for f in fields or []:
+        name = (f.get("name") or "").strip()
+        if not name:
+            continue
+        t = f.get("type", "text")
+        t = t if t in VALID_FTYPES else ("number" if t in ("int", "integer", "float", "amount") else
+                                         "checkbox" if t in ("bool", "boolean") else "text")
+        nf = mk_field(name, t)
+        if f.get("required"): nf["required"] = True
+        if f.get("options"): nf["options"] = [str(o) for o in f["options"]][:6]
+        out.append(nf)
+    return out or [mk_field("Name")]
+
+def ai_execute_tool(app, name, args, emit):
+    """Apply one tool call to the app. Returns short JSON-able result for the model."""
+    spec = app.setdefault("spec", {})
+    ents, pages = spec.setdefault("entities", []), spec.setdefault("pages", [])
+    if name == "think":
+        emit({"type": "thinking", "text": str(args.get("plan", ""))[:600]})
+        return "plan noted — proceed with tools"
+    if name == "upsert_entity":
+        ename = (args.get("name") or "Item").strip().title()[:24]
+        slug = slugify(ename)
+        fields = _norm_fields(args.get("fields"))
+        seed = [[("" if c is None else str(c)) for c in row] for row in (args.get("seed_rows") or [])][:5]
+        ent = next((e for e in ents if e["slug"] == slug), None)
+        if ent:
+            ent["fields"], ent["seed"] = fields, seed
+            act = "updated"
+        else:
+            ents.append(dict(name=ename, slug=slug, fields=fields, seed=seed))
+            pages.append(dict(name=ename if ename.lower().endswith("s") else ename + "s",
+                              type="list", entity=slug))
+            act = "created"
+        emit({"type": "tool", "name": name, "args": {"name": ename}, "result": act})
+        return {"name": ename, "action": act, "fields": len(fields)}
+    if name == "add_page":
+        pname = (args.get("name") or "New Page").strip().title()[:24]
+        page = dict(name=pname, type=("form" if args.get("type") == "form" else "list"))
+        if args.get("entity"):
+            page["entity"] = args["entity"]
+        elif ents:
+            page["entity"] = ents[-1]["slug"]
+        pages.append(page)
+        emit({"type": "tool", "name": name, "args": {"name": pname}, "result": "added"})
+        return {"page": pname, "type": page["type"]}
+    if name == "set_theme":
+        hexv = str(args.get("accent") or "").strip()
+        if not re.match(r"^#[0-9a-fA-F]{6}$", hexv):
+            return {"error": "accent must be #RRGGBB"}
+        app["theme"] = {"accent": hexv}
+        emit({"type": "tool", "name": name, "args": {"accent": hexv}, "result": "applied"})
+        return {"accent": hexv}
+    if name == "rename_app":
+        nm = (args.get("name") or "").strip().title()[:40]
+        if nm:
+            app["name"] = nm
+            emit({"type": "tool", "name": name, "args": {"name": nm}, "result": "renamed"})
+        return {"name": nm}
+    if name == "set_summary":
+        app["summary"] = str(args.get("summary") or "")[:160]
+        emit({"type": "tool", "name": name, "args": {"summary": app["summary"]}, "result": "set"})
+        return {"summary": app["summary"]}
+    return {"error": "unknown tool"}
+
+class Emitter:
+    """SSE-safe event pump: if the client disconnects the backend keeps working."""
+    def __init__(self, fn):
+        self.fn, self.alive = fn, True
+    def __call__(self, ev):
+        if not self.alive:
+            return
+        try:
+            self.fn(ev)
+        except Exception:
+            self.alive = False
+
+def ai_spec_context(app):
+    spec = app.get("spec", {})
+    return json.dumps({
+        "name": app.get("name"), "theme": app.get("theme"), "summary": app.get("summary"),
+        "entities": [dict(name=e["name"], slug=e["slug"],
+                          fields=[f["name"] + ":" + f["type"] for f in e.get("fields", [])],
+                          seed_row_count=len(e.get("seed", []))) for e in spec.get("entities", [])],
+        "pages": [p["name"] + "(" + p.get("type", "list") + ")" for p in spec.get("pages", [])],
+    }, ensure_ascii=False)
+
+def ai_agent_conversation(app, instruction, is_new, emit, rounds=4):
+    """Multi-round tool-calling loop. Returns final assistant text (or raises)."""
+    msgs = [{"role": "system", "content": BASE44_AGENT_PROMPT + "\n\nCURRENT APP STATE: " + ai_spec_context(app)}]
+    if is_new:
+        msgs.append({"role": "user", "content": "Baseline build — user request: " + instruction})
+    else:
+        msgs += (app.get("ai_history") or [])[-8:]
+        msgs.append({"role": "user", "content": "User change request: " + instruction})
+    final_text, touched = "", False
+    for _ in range(rounds):
+        m = oai_chat(msgs, tools=AI_TOOLS)
+        msgs.append({"role": "assistant", "content": m.get("content"),
+                     **({"tool_calls": m["tool_calls"]} if m.get("tool_calls") else {})})
+        tcs = m.get("tool_calls") or []
+        if not tcs:
+            final_text = (m.get("content") or "").strip()
+            break
+        for tc in tcs:
+            fn = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"].get("arguments") or "{}")
+            except Exception:
+                args = {}
+            before = json.dumps(app["spec"], default=str)
+            res = ai_execute_tool(app, fn, args, emit)
+            if fn == "think":
+                msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(res)})
+                continue
+            touched = True
+            after = json.dumps(app["spec"], default=str)
+            if after != before:   # spec mutated → regenerate code files + notify UI for live preview
+                app["files"] = code_files(app["spec"], app)
+                emit({"type": "preview", "changed": fn, "file_count": len(app["files"])})
+            msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(res, default=str)})
+    app["ai_history"] = (app.get("ai_history") or [])[-6:] + [
+        {"role": "user", "content": instruction}, {"role": "assistant", "content": final_text or "(applied changes)"}]
+    return final_text, touched
+
+def ai_agent_create(prompt):
+    """AI-first app creation. Returns (spec_dict, name, theme, summary, ai_history) or None on failure."""
+    if not AI_KEYS or AI_DISABLED:
+        return None
+    appshell = {"name": "", "theme": {}, "summary": "", "spec": {"entities": [], "pages": []}, "messages": []}
+    emit = Emitter(lambda ev: None)   # sync create — no live stream needed
+    try:
+        ai_agent_conversation(appshell, prompt, is_new=True, emit=emit, rounds=5)
+    except Exception:
+        return None
+    spec = appshell["spec"]
+    if not spec.get("entities"):
+        return None
+    return {"spec": spec, "name": appshell["name"], "theme": appshell.get("theme"),
+            "summary": appshell["summary"], "ai_history": appshell.get("ai_history", [])}
+
+def run_agent_stream(app, instruction, d, u, emit):
+    """Full agent turn: AI (tool calls + think) → fallback deterministic. Owns finalize + done event."""
+    steps, changes, ai_ok, final = [], [], False, ""
+    model = AI_MODEL if AI_KEYS and not AI_DISABLED else "template"
+    emit({"type": "start", "model": model, "keys": len(AI_KEYS)})
+    try:
+        if AI_KEYS and not AI_DISABLED:
+            final, touched = ai_agent_conversation(app, instruction, is_new=False, emit=emit)
+            ai_ok = True
+            steps.append("Planned with " + AI_MODEL)
+            steps.append("Applied via tool calls" + (":"" re-built files" if touched else ""))
+    except Exception:
+        ai_ok = False
+        emit({"type": "notice", "text": "AI unavailable — deterministic agent (template engine)"})
+    if not ai_ok:
+        steps, changes = agent_turn(app, instruction)
+        for s in steps:
+            emit({"type": "step", "text": s})
+    app["spec"].setdefault("entities", []), app["spec"].setdefault("pages", [])
+    app["files"] = code_files(app["spec"], app)
+    app["credits_used"] = round(app.get("credits_used", 0) + 0.4, 2)
+    app["updated"] = time.time()
+    logline = ("AI/" + model if ai_ok else "template") + " | " + instruction + " | " + "—".join(steps) + (" | " + final if final else "")
+    app["logs"].append([str(time.time()), logline])
+    save(d)
+    emit({"type": "done", "mode": "ai" if ai_ok else "fallback",
+          "steps": steps, "reply": final,
+          "credits": {"used": usage_total(u), "left": round(max(0, CREDIT_LIMIT - usage_total(u)), 2)}})
+
+# ════════════════════════════════════════════════════════════════════════════════════════════
 
 # ---- websocket stub (nafs prod parity: client yconnecti, y9bal ping/echo, fallback graceful) ----
 def ws_accept(key):
@@ -488,12 +762,28 @@ class Handler(SimpleHTTPRequestHandler):
                 name=body.get("name") or "Untitled App", icon=(body.get("name") or "A")[0].upper(),
                 color="#4d33de", summary=body.get("summary") or "Empty app — describe a change to build it.",
                 entities=[], pages=[])
+            ai_hist = []
+            if "prompt" in body and usage_total(u) < CREDIT_LIMIT:
+                made = ai_agent_create(prompt)
+                if made:
+                    spec = made["spec"]
+                    spec["keywords"] = spec.get("keywords") or "ai"
+                    spec["icon"] = (made["name"] or spec.get("icon") or "A")[0].upper()
+                    app_name = made["name"] or spec.get("name") or prompt[:30].title()
+                    spec["name"] = app_name
+                    spec["summary"] = made["summary"] or spec.get("summary") or "Built by AI from your prompt."
+                    ai_hist = made["ai_history"]
             app = {"id": "a_" + uuid.uuid4().hex[:10], "name": spec.get("name") or "Untitled App",
                    "user_id": u["id"], "created": time.time(), "updated": time.time(),
                    "state": "draft", "visibility": "private", "live_version": "", "bundle_version": "1",
                    "sub_domain": slugify(spec.get("name") or "app"), "spec": spec,
                    "files": code_files(spec, {}), "logs": [["t0", "Agent seeding app…"], ["t1", "App shell ready"]],
                    "credits_used": 1.5, "theme": spec.get("theme", {"accent": "#ff773c"})}
+            if "prompt" in body:
+                app["theme"] = (spec.get("theme") if isinstance(spec.get("theme"), dict) and spec.get("theme") else app["theme"])
+                if ai_hist:
+                    app["ai_history"] = ai_hist
+                    app["logs"].append([str(time.time()), "AI spec built via tool calls"])
             d["apps"].append(app); save(d)
             return self.js(pub(app))
         m = re.match(r"^/api/apps/([\w-]+)$", path)
@@ -513,6 +803,32 @@ class Handler(SimpleHTTPRequestHandler):
             if self.command == "DELETE":
                 d["apps"].remove(app); save(d)
                 return self.js({"ok": True})
+        m = re.match(r"^/api/apps/([\w-]+)/agent/stream$", path)
+        if m and self.command == "POST":
+            app = next((a for a in d["apps"] if a["id"] == m.group(1) and a["user_id"] == u["id"]), None)
+            if not app:
+                return self.js({"error": "not_found"}, 404)
+            body = self.readbody()
+            instruction = (body.get("message") or "").strip()
+            if not instruction:
+                return self.js({"error": "empty message"}, 400)
+            if usage_total(u) >= CREDIT_LIMIT:
+                return self.js({"error": "insufficient_credits", "message": "You've used all your daily credits."}, 402)
+            # — SSE headers —
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            def raw_emit(ev):
+                self.wfile.write(b"data: " + json.dumps(ev, ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.flush()
+            emit = Emitter(raw_emit)
+            try:
+                run_agent_stream(app, instruction, d, u, emit)
+            except ConnectionError:
+                pass
+            return
         m = re.match(r"^/api/apps/([\w-]+)/agent$", path)
         if m and self.command == "POST":
             app = next((a for a in d["apps"] if a["id"] == m.group(1) and a["user_id"] == u["id"]), None)

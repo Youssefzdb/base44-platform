@@ -108,3 +108,28 @@ Real chromium drives the REAL react build — 8 checks:
 - [x] publish → state live, slug `crm`, public `/api/published/crm` NO auth
 - [x] `/p/crm` runtime page served (5.3 KB)
 - [x] logs recorded per app
+
+## AI agent (OpenAI — tool calls + thinking, SSE)
+
+Keys: `/gpt.txt` (7 project keys, comma-separated; loaded at boot, **rotated on 401/429**,
+models fallback `gpt-4.1-mini → gpt-4o-mini → gpt-4o`). Keys are never stored in the repo.
+
+`AGENT` endpoint: `POST /api/apps/:id/agent/stream` (SSE). Event chain:
+
+```
+start → thinking → tool* → preview → tool* … → done(+credits)     (AI mode)
+start (template) → step* → done                                  (fallback, B44_DISABLE_AI=1)
+```
+
+Tools the model calls (executed deterministically by the backend → spec + code files):
+`think(plan)` · `upsert_entity(name, fields, seed_rows)` · `add_page(name, type, entity)`
+· `set_theme(accent_rgb_hex)` · `rename_app(name)` · `set_summary(text)`
+
+- **thinking** = the model's plan streamed live into the chat UI.
+- **preview** event emitted on every spec mutation → React bumps the runtime iframe (`rev=`)
+  → **live preview** re-renders while the agent applies changes.
+- **create** (`POST /api/apps` with prompt) is AI-first too: baseline spec built entirely via tool calls.
+- Every event is persisted: `logs_<app>.jsonl`, app `ai_history` (last 8 msgs as model context).
+
+Verbose smoke (real Expectations): `AI create ~12s`, turn `~5-7s`.
+
