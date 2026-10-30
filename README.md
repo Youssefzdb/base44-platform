@@ -133,3 +133,22 @@ Tools the model calls (executed deterministically by the backend → spec + code
 
 Verbose smoke (real Expectations): `AI create ~12s`, turn `~5-7s`.
 
+
+## lp.dev sandbox (`s` tool — remote runner)
+
+`/usr/local/bin/s` → `/root/s.py`: a thin shell over the **lp.dev terminal sandbox** (remote Linux
+container; python 3.13 / node 26 / bun 1.3, open egress). Rate-limited by the lp.dev Cloudflare
+edge (~1 call / 20s from the same IP). Two integration tools use it:
+
+| Tool | What it does |
+|---|---|
+| `tools/sandbox_check.sh` | ships a **lean tarball** (server + runtime.html, no data/, no vendor) → remote `py_compile` → boots `B44_DISABLE_AI=1` server → 6 smoke steps (login, create, publish, /p) — **no OpenAI keys ever leave the host** |
+| `tools/sandbox_jsx_check.py <app_id>` | pulls the app's `gen_files` → remote **bun Transpiler** parses every .jsx/.js → per-file OK/BAD verdict |
+
+```sh
+bash tools/sandbox_check.sh
+python3 tools/sandbox_jsx_check.py a_bb0f216e70 http://localhost:8510 /tmp/siteapp3.txt
+```
+
+`tests/ai_site_test.py` runs the remote bun parse automatically as check **6** when `s` is on PATH
+(skipped gracefully otherwise).

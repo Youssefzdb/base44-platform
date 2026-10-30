@@ -8,7 +8,7 @@ Flow:
 4. publish → public /api/published/:slug exposes gen_files + mode
 Exit 0 iff all pass. Long test (~1-2 min): real model calls.
 """
-import json, sys, time, urllib.request
+import json, os, shutil, subprocess, sys, tempfile, time, urllib.request
 from collections import Counter
 
 B = "http://localhost:8510"
@@ -60,6 +60,17 @@ check("4. file count grows", len(gen2) >= len(gen), f"{len(gen)}→{len(gen2)}")
 pub = req(f"/api/apps/{app_id}/publish", "POST", token=tok)
 pubd = json.loads(urllib.request.urlopen(B + f"/api/published/{pub['sub_domain']}").read())
 check("5. published public runtime has site", pubd.get("mode") == "website" and len(pubd.get("gen_files", {})) == len(gen2))
+
+# 6. optional: remote syntax check of all gen_files in the lp.dev sandbox (needs /usr/local/bin/s)
+if shutil.which("s"):
+    tokf = os.path.join(tempfile.mkdtemp(), "tok")
+    open(tokf, "w").write(app_id + " " + tok)
+    tooldir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
+    r = subprocess.run([sys.executable, os.path.join(tooldir, "sandbox_jsx_check.py"),
+                        app_id, B, tokf], capture_output=True, text=True, timeout=300)
+    check("6. sandbox bun parse (remote)", r.returncode == 0, (r.stdout[-220:] or r.stderr[-220:]))
+else:
+    print("· 6. sandbox bun parse skipped (no `s` on PATH)")
 
 bad = [r for r in results if not r[1]]
 print(json.dumps({"pass": len(results) - len(bad), "fail": len(bad)}, ensure_ascii=False))
