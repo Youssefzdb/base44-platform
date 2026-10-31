@@ -364,6 +364,128 @@ AI_TOOLS = [
 ]
 
 WEBSITE_RE = re.compile(r"website|web-? ?site|landing( page)?|portfolio|restaurant|cafe|caf[ée]|menu|e-?commerce|onlinestore|store site|shop site|boutique|template site|maw9a[39]|situ we?b", re.I)
+URL_RE = re.compile(r"https?://[\w\-._~:/?#\[\]@!$&'()*+,;=%]+", re.I)
+
+def _safe_url(u):
+    """Return the URL if it's a public http(s) address, else None (SSRF guard: no private/loopback nets)."""
+    u = u.rstrip(".,;:)!\"'")
+    if not re.match(r"^https?://", u, re.I):
+        return None
+    m = re.match(r"^https?://([^/:?#]+)", u, re.I)
+    host = (m.group(1) if m else "").strip().strip("[]").lower()
+    if not host or host == "localhost" or re.match(r"^(127\.|10\.|192\.168\.|169\.254\.|0\.)", host) or host in ("::1",):
+        return None
+    if re.match(r"^172\.(1[6-9]|2\d|3[01])\.", host):
+        return None
+    return u
+
+_CLONE_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"}
+
+def extract_site_context(url):
+    """Morph-style mini extraction (stdlib only): title, palette, fonts, headings, nav, images, copy sample."""
+    u = _safe_url(url)
+    if not u:
+        return None
+    try:
+        with urllib.request.urlopen(urllib.request.Request(u, headers=_CLONE_UA), timeout=14) as r:
+            ctype = r.headers.get("Content-Type", "")
+            if "html" not in ctype:
+                return None
+            page = r.read(700000).decode("utf-8", "ignore")
+    except Exception:
+        return None
+    headers, texts, imgs, links = [], [], [], []
+    title = ""
+    out_desc = [None]
+    try:
+        from html.parser import HTMLParser
+        class _Scrape(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                a = dict(attrs)
+                if tag == "img" and a.get("src") and len(imgs) < 14:
+                    imgs.append(urljoin(u, a["src"]))
+                if tag == "link" and a.get("rel", "").lower() == "stylesheet" and a.get("href"):
+                    links.append(urljoin(u, a["href"]))
+                if tag == "meta" and a.get("name", "").lower() == "description" and a.get("content") and out_desc[0] is None:
+                    out_desc[0] = a["content"][:200]
+                if tag == "meta" and a.get("property") == "og:image" and a.get("content") and len(imgs) < 14:
+                    imgs.insert(0, urljoin(u, a["content"]))
+                if tag in ("h1", "h2", "h3") and len(headers) < 14:
+                    headers.append([tag] + [""])
+            def handle_data(self, data):
+                t = " ".join(data.split())
+                if not t:
+                    return
+                if headers and headers[-1][1] == "":
+                    headers[-1][1] = t[:70]
+                if len(texts) < 45 and t.count(" ") < 60:
+                    texts.append(t[:110])
+        _Scrape().feed(page)
+    except Exception:
+        pass
+    style_css = " ".join(re.findall(r"<style[^>]*>(.*?)</style>", page, re.S | re.I))[:20000]
+    ss_links = [l for l in links if re.search(r"\.css(\?|$)", l, re.I)][:1]
+    if ss_links:                                 # one external stylesheet → real palettes (morph behavior)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(ss_links[0], headers=_CLONE_UA), timeout=8) as r:
+                style_css = (style_css + r.read(200000).decode("utf-8", "ignore"))[:220000]
+        except Exception:
+            pass
+    colors = [c.lower() for c in re.findall(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b|rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(?:,\s*[\d.]+)?\s*\)", style_css)]
+    freq = {}
+    for c in colors:
+        freq[c] = freq.get(c, 0) + 1
+    palette = [c for c, _ in sorted(freq.items(), key=lambda kv: -kv[1])[:10]]
+    fonts = list(dict.fromkeys(re.findall(r"font-family\s*:\s*([^;}]+)", style_css, re.I)))[:5]
+    m = re.search(r"<title[^>]*>([^<]+)</title>", page, re.I)
+    title = (m.group(1).strip() if m else "")[:90]
+    headings = [f"{h[0].upper()}: {h[1]}" for h in headers if h[1]]
+    if not headings and title:
+        headings = ["TITLE: " + title]
+    return {"url": u, "host": re.sub(r"^https?://([^/]+).*", r"\1", u), "title": title,
+            "desc": out_desc[0] or "", "palette": palette, "fonts": fonts,
+            "headings": headings,
+            "copy": " | ".join(texts)[:700], "images": list(dict.fromkeys(imgs))[:8]}
+
+def clone_context_block(ctx):
+    if not ctx:
+        return ""
+    out = ["REFERENCE SITE ANALYSIS — fetched " + ctx["host"] + (" — “" + ctx["title"] + "”" if ctx["title"] else "")]
+    if ctx["desc"]:
+        out.append("Description: " + ctx["desc"])
+    if ctx["palette"]:
+        out.append("Dominant palette (hex/rgb, by usage): " + ", ".join(ctx["palette"]))
+    if ctx["fonts"]:
+        out.append("Font families: " + " | ".join(f.strip()[:60] for f in ctx["fonts"]))
+    if ctx["headings"]:
+        out.append("Content hierarchy: " + " • ".join(ctx["headings"][:10]))
+    if ctx["copy"]:
+        out.append("Body copy sample: " + ctx["copy"][:450])
+    if ctx["images"]:
+        out.append("Images visible: " + ", ".join(ctx["images"][:8]))
+    out.append("=> Build in the SAME SPIRIT (palette mood, structure, typography character, section rhythm). "
+               "Adapt the content to the user's request — never copy the original brand text verbatim.")
+    return "\n".join(out)
+
+def _safe_url_probe(text):
+    m = URL_RE.search(text or "")
+    return bool(m and _safe_url(m.group(0)))
+
+def clone_reference(app, instruction):
+    """Find a URL in the request; extract once, cache on app['clone'], return the context block."""
+    m = URL_RE.search(instruction)
+    u = _safe_url(m.group(0)) if m else None
+    if not u:
+        app.pop("clone", None)
+        return ""
+    cached = app.get("clone") or {}
+    if cached.get("url") == u:
+        return cached.get("block", "")
+    ctx = extract_site_context(u)
+    block = clone_context_block(ctx) if ctx else ""
+    app["clone"] = {"url": u, "block": block, "host": ctx["host"] if ctx else ""}
+    return block
+
 
 WEBSITE_AGENT_PROMPT = """You are Base44's website architect. From the user's request you build a COMPLETE, modern, production-quality React website from scratch — using ONLY tool calls, no other dependencies.
 
@@ -380,7 +502,8 @@ Mandatory flow:
 Hard rules:
 - Imports ONLY from 'react', 'react-dom' or relative paths ('./x' from src/, '../components/x' from pages...jsx). NO other npm packages. No router — sections in single page + smooth anchor scroll.
 - JSX only with className (NOT class). Use only CSS in styles.css (no inline style objects as primary styling).
-- Truly polished: spacing consistent, hover transitions (transition + :hover), focus states, aria-labels on nav toggles/buttons, alt on <img>, semantic <header><main><section><footer>.
+- Truly polished: spacing consistent, hover transitions (transition + :hover), focus states, aria-labels on nav toggles/buttons, aria-expanded on menu toggles, alt on <img>, semantic <header><main><section><footer>.
+- When "REFERENCE SITE ANALYSIS — fetched <host>" is present in the request: treat it as a design reference. Mirror its palette family, typography character and section rhythm; adapt all copy to the user's brief — do NOT reproduce the original wording, brand or logos.
 - Cohesive brand: derive 2 accent colors + 1 neutral from the business theme; big display hero with letter-spacing.
 - Copy in the user's language, realistic and business-specific (no lorem ipsum, no TODO, nothing left blank).
 - Keep every file complete and self-contained; never reference files you never wrote.
@@ -511,7 +634,8 @@ def ai_spec_context(app):
 def ai_agent_conversation(app, instruction, is_new, emit, rounds=0, website=None):
     """Multi-round tool-calling loop. Returns (final_text, touched)."""
     if website is None:
-        website = bool(app.get("mode") == "website" or WEBSITE_RE.search(instruction))
+        website = bool(app.get("mode") == "website" or WEBSITE_RE.search(instruction) or _safe_url_probe(instruction))
+    ref_block = clone_reference(app, instruction) if (website and is_new) else ""
     if website:
         gf = app.setdefault("gen_files", {})
         tree = ", ".join(f"{p}({len(c)}b)" for p, c in sorted(gf.items())) or "(empty — fresh build)"
@@ -522,7 +646,10 @@ def ai_agent_conversation(app, instruction, is_new, emit, rounds=0, website=None
     sysmsg = (WEBSITE_AGENT_PROMPT if website else BASE44_AGENT_PROMPT) + "\n\n" + state
     msgs = [{"role": "system", "content": sysmsg}]
     if is_new:
-        msgs.append({"role": "user", "content": ("Build this website — user request: " if website else "Baseline build — user request: ") + instruction})
+        user_msg = ("Build this website — user request: " if website else "Baseline build — user request: ") + instruction
+        if ref_block:
+            user_msg += "\n\n" + ref_block
+        msgs.append({"role": "user", "content": user_msg})
     else:
         msgs += (app.get("ai_history") or [])[-8:]
         msgs.append({"role": "user", "content": ("User website change request: " if website else "User change request: ") + instruction})
@@ -572,7 +699,7 @@ def ai_agent_create(prompt):
     """AI-first app creation. Returns dict (spec/name/theme/summary/ai_history[/mode/gen_files]) or None."""
     if not AI_KEYS or AI_DISABLED:
         return None
-    website = bool(WEBSITE_RE.search(prompt))
+    website = bool(WEBSITE_RE.search(prompt) or _safe_url_probe(prompt))
     result = None
     for attempt in range(3):                                     # models sometimes reply without tools → retry
         appshell = {"name": "", "theme": {}, "summary": "", "spec": {"entities": [], "pages": []}, "gen_files": {}}
@@ -600,7 +727,7 @@ def ai_agent_create(prompt):
             result["name"] = nm.title()[:40]
         return {"spec": result["spec"], "name": result["name"], "theme": result.get("theme"),
                 "summary": result["summary"], "ai_history": result.get("ai_history", []),
-                "mode": "website", "gen_files": gf}
+                "mode": "website", "gen_files": gf, "clone": (result.get("clone") or {}).get("host", "")}
     return {"spec": result["spec"], "name": result["name"], "theme": result.get("theme"),
             "summary": result["summary"], "ai_history": result.get("ai_history", [])}
 
@@ -900,7 +1027,6 @@ class Handler(SimpleHTTPRequestHandler):
                     ai_hist = made["ai_history"]
                     if made.get("mode") == "website":
                         ai_mode, ai_gen = "website", made.get("gen_files") or {}
-
             app = {"id": "a_" + uuid.uuid4().hex[:10], "name": spec.get("name") or "Untitled App",
                    "user_id": u["id"], "created": time.time(), "updated": time.time(),
                    "state": "draft", "visibility": "private", "live_version": "", "bundle_version": "1",
@@ -913,7 +1039,10 @@ class Handler(SimpleHTTPRequestHandler):
                 app["theme"] = (spec.get("theme") if isinstance(spec.get("theme"), dict) and spec.get("theme") else app["theme"])
                 if ai_hist:
                     app["ai_history"] = ai_hist
-                    app["logs"].append([str(time.time()), ("AI website built — %d files (tool calls)" if app["mode"] == "website" else "AI spec built via tool calls")])
+                    app["logs"].append([str(time.time()), ("AI website built — %d files (tool calls)" % len(app.get("gen_files") or {}) if app["mode"] == "website" else "AI spec built via tool calls")])
+                    if isinstance(made.get("clone"), str) and made["clone"]:
+                        app["clone_host"] = made["clone"]
+                        app["logs"].append([str(time.time()), "clone context: " + made["clone"]])
             d["apps"].append(app); save(d)
             return self.js(pub(app))
         m = re.match(r"^/api/apps/([\w-]+)$", path)

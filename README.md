@@ -152,3 +152,16 @@ python3 tools/sandbox_jsx_check.py a_bb0f216e70 http://localhost:8510 /tmp/sitea
 
 `tests/ai_site_test.py` runs the remote bun parse automatically as check **6** when `s` is on PATH
 (skipped gracefully otherwise).
+
+## Clone-from-URL (Morph-inspired)
+
+Paste any URL in the prompt ("landing site inspired by https://stripe.com for X") → server-side
+stdlib extractor (`extract_site_context()`) builds a **REFERENCE SITE ANALYSIS** block — palette
+by usage frequency, font families, content hierarchy, copy sample, visible images, og meta — that
+gets injected into the website agent prompt. The agent mirrors palette/typography/section rhythm
+but **adapts the copy** (originals are never reproduced verbatim).
+
+- SSRF guard: localhost/private nets (127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, ::1) rejected
+- one ≤200 KB stylesheet fetched for real front-end palettes (morph's token-extraction, miniaturized)
+- context cached on `app.clone` (one fetch per URL, reused on turns)
+- tests: `tests/clone_extract_test.py` (8 checks, no AI calls) — SSRF, extraction shape, caching
